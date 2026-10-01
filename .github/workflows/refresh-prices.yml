@@ -1,8 +1,16 @@
 name: Refresh spice prices
 
+# Keeps the La-kera Firestore `prices` collection fresh with Kerala
+# mandi modal prices from KisanDeals (which republishes Agmarknet/eNAM
+# APMC data). The official data.gov.in API refuses connections from
+# outside India, so it cannot be used from GitHub-hosted runners.
+# The app reads Firestore live, so new prices appear in the app with
+# no app update. Runs daily at 17:15 IST. Can also be run manually
+# from the Actions tab.
+
 on:
   schedule:
-    - cron: "45 11 * * *"
+    - cron: "45 11 * * *" # 11:45 UTC = 17:15 IST
   workflow_dispatch: {}
 
 permissions:
@@ -13,13 +21,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: pip install firebase-admin requests
+
       - name: Refresh prices
         env:
-          DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: python tools/refresh_prices.py
