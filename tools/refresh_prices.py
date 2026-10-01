@@ -1,109 +1,135 @@
 #!/usr/bin/env python3
 """Daily spice-price refresh for La-kera.
 
-Pulls Kerala modal prices from the official Agmarknet feed on data.gov.in
-(Government of India Open Data), converts ₹/quintal -> ₹/kg, validates each
-price against sane bounds, and updates the Firestore `prices` collection.
-The app picks the new values up live via its Firestore listener.
+Pulls Kerala mandi modal prices from KisanDeals state pages
+(https://www.kisandeals.com/mandiprices/<COMMODITY>/KERALA/ALL), which
+republish the official Agmarknet / eNAM APMC data. Why not data.gov.in
+directly? api.data.gov.in refuses connections from outside India
+(connection refused from GitHub's runners — verified 2026-10-01), so the
+official API cannot be used from GitHub Actions. KisanDeals serves the
+same underlying mandi data and is reachable worldwide.
 
-Design rules (honesty first):
-- A price is only written when it was actually fetched and passed the
-  sanity bounds. On any fetch/parse/validation failure the existing
-  Firestore value is left untouched and a warning is logged (visible in
-  the GitHub Actions run log).
-- cinnamon and vanilla have no reliable free structured daily feed; the
-  script looks for them in the feed but in practice they keep their last
-  verified value until a source reports.
+For each spice the script parses the market-wise table, takes the rows
+from the freshest reported date, and uses the MEDIAN modal price across
+Kerala markets (₹/quintal -> ₹/kg). A price is written to Firestore only
+when ALL of these hold:
+  - the page fetched and parsed successfully,
+  - the freshest data is at most 45 days old,
+  - the value is inside the spice's sane ₹/kg bounds,
+  - it does not jump more than 50% from the stored price (guards
+    against grade mismatches and bad/cloned source data).
+Otherwise the stored value is kept and the reason is logged (visible in
+the GitHub Actions run log).
+
+vanilla has no reliable free daily source (KisanDeals serves a generic
+fallback table for it) — it always keeps its last verified value.
+cinnamon mandi data is thin and grade-mismatched vs the app's stored
+wholesale value, so in practice the jump guard keeps it manual too.
 
 Env:
-  DATA_GOV_IN_API_KEY    free key from https://data.gov.in (My Account)
   FIREBASE_SERVICE_ACCOUNT  full service-account JSON (repo secret)
 """
-import json
 import os
 import re
 import sys
 import tempfile
-from statistics import mean
+from datetime import date, datetime
+from html.parser import HTMLParser
+from statistics import median
 
 import requests
 
-RESOURCE_ID = "9ef84268-d588-465a-a308-a864a43d0070"  # Agmarknet daily mandi prices
-API_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
-UA = {"User-Agent": "la-kera-price-refresh/1.0 (+https://github.com/athulsaji367-dot/la-kera)"}
+BASE = "https://www.kisandeals.com/mandiprices/{slug}/KERALA/ALL"
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
+                    "la-kera-price-refresh/2.0"}
+MAX_AGE_DAYS = 45
+MAX_JUMP = 0.50  # reject changes larger than +/-50% vs stored price
 
-# Firestore doc id -> (commodity matcher, sane ₹/kg bounds)
-# matcher receives the normalized commodity name (lowercase, no spaces/punct)
-def is_dry_ginger(n):
-    return "ginger" in n and "dry" in n
-
-
+# Firestore doc id -> (KisanDeals commodity slug, sane ₹/kg bounds)
 TARGETS = {
-    "cardamom": (lambda n: "cardamom" in n, (1000, 8000)),
-    "pepper": (lambda n: "blackpepper" in n or n == "pepper", (300, 1100)),
-    "cloves": (lambda n: "cloves" in n, (400, 2000)),
-    "nutmeg": (lambda n: "nutmeg" in n, (300, 2000)),
-    "cinnamon": (lambda n: "cinnamon" in n, (200, 1200)),
-    "ginger": (is_dry_ginger, (80, 500)),
-    "turmeric": (lambda n: "turmeric" in n, (60, 400)),
-    "vanilla": (lambda n: "vanilla" in n, (8000, 40000)),
+    "cardamom": ("CARDAMOM", (1000, 8000)),
+    "pepper": ("BLACK-PEPPER", (300, 1100)),
+    "cloves": ("CLOVES", (400, 2000)),
+    "nutmeg": ("NUTMEG", (300, 2000)),
+    "cinnamon": ("CINNAMON", (200, 1200)),
+    "ginger": ("GINGER-DRY", (80, 500)),
+    "turmeric": ("TURMERIC", (60, 400)),
+    # "vanilla": no trustworthy daily feed — intentionally absent.
 }
 
 
-def norm(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+class TableParser(HTMLParser):
+    """Collect table rows as lists of cell texts."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows, self._row, self._cell = [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None:
+            self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
 
 
-def fetch_kerala_rows(api_key: str):
-    """Fetch all of today's Kerala rows from the Agmarknet snapshot."""
-    rows, offset, limit = [], 0, 5000
-    while True:
-        params = {
-            "api-key": api_key,
-            "format": "json",
-            "filters[state]": "Kerala",
-            "limit": limit,
-            "offset": offset,
-        }
-        r = requests.get(API_URL, params=params, headers=UA, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        batch = data.get("records", [])
-        rows.extend(batch)
-        total = int(data.get("total", len(rows)))
-        if len(rows) >= total or not batch:
-            return rows
-        offset += limit
-
-
-def modal_prices_per_kg(rows):
-    """Group modal prices (₹/quintal) by normalized commodity -> ₹/kg mean."""
-    by_commodity = {}
-    for row in rows:
-        try:
-            modal = float(row["modal_price"])
-        except (KeyError, TypeError, ValueError):
+def fetch_latest_median_per_kg(slug):
+    """Return (₹/kg median modal, freshest date, market count) or raise."""
+    r = requests.get(BASE.format(slug=slug), headers=UA, timeout=60)
+    r.raise_for_status()
+    parser = TableParser()
+    parser.feed(r.text)
+    by_date = {}
+    for cells in parser.rows:
+        # Market table: [desc, variety, market, district, state,
+        #                 min, modal, max, change, date, trend]
+        if len(cells) < 10:
             continue
-        if modal <= 0:
+        m_date = re.fullmatch(r"(\d{2}/\d{2}/\d{4})", cells[9] or "")
+        m_modal = re.search(r"₹\s*([\d,]+)", cells[6] or "")
+        if not m_date or not m_modal:
             continue
-        by_commodity.setdefault(norm(row.get("commodity", "")), []).append(modal / 100.0)
-    return {name: round(mean(vals)) for name, vals in by_commodity.items() if vals}
+        d = datetime.strptime(m_date.group(1), "%d/%m/%Y").date()
+        modal = int(m_modal.group(1).replace(",", ""))
+        if modal > 0:
+            by_date.setdefault(d, []).append(modal)
+    if not by_date:
+        raise ValueError("no market rows parsed")
+    freshest = max(by_date)
+    vals = by_date[freshest]
+    return round(median(vals) / 100), freshest, len(vals)
 
 
 def main():
-    api_key = os.environ.get("DATA_GOV_IN_API_KEY", "").strip()
     sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
-    if not api_key:
-        sys.exit("ERROR: DATA_GOV_IN_API_KEY secret is not set. "
-                 "Get a free key at https://data.gov.in (My Account -> API key) "
-                 "and add it as a repo secret.")
     if not sa_json:
         sys.exit("ERROR: FIREBASE_SERVICE_ACCOUNT secret is not set.")
 
-    print("Fetching today's Kerala mandi prices from Agmarknet (data.gov.in)...")
-    rows = fetch_kerala_rows(api_key)
-    print(f"  {len(rows)} Kerala records in today's snapshot.")
-    prices = modal_prices_per_kg(rows)
+    print("Fetching Kerala mandi modal prices from KisanDeals...")
+    fetched, fetch_errors = {}, {}
+    for doc_id, (slug, _bounds) in TARGETS.items():
+        try:
+            price, freshest, n = fetch_latest_median_per_kg(slug)
+            fetched[doc_id] = (price, freshest, n)
+            print(f"  {doc_id}: ₹{price}/kg (median of {n} markets, {freshest})")
+        except Exception as e:  # one bad page must not kill the others
+            fetch_errors[doc_id] = str(e)
+            print(f"  {doc_id}: FETCH FAILED ({e})")
+
+    if not fetched:
+        sys.exit("ERROR: every KisanDeals fetch failed; prices untouched.")
 
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -114,19 +140,28 @@ def main():
     firebase_admin.initialize_app(credentials.Certificate(sa_path))
     db = firestore.client()
 
+    today = date.today()
     updated, kept = [], []
-    for doc_id, (matcher, (lo, hi)) in TARGETS.items():
-        fresh = [p for name, p in prices.items() if matcher(name)]
+    for doc_id, (_slug, (lo, hi)) in TARGETS.items():
         ref = db.collection("prices").document(doc_id)
         snap = ref.get()
         current = snap.to_dict().get("pricePerKg") if snap.exists else None
-        if not fresh:
-            kept.append(f"{doc_id}: no feed rows today (kept {current})")
+        if doc_id in fetch_errors:
+            kept.append(f"{doc_id}: fetch failed (kept {current})")
             continue
-        new_price = round(mean(fresh))
+        new_price, freshest, _n = fetched[doc_id]
+        age = (today - freshest).days
+        if age > MAX_AGE_DAYS:
+            kept.append(f"{doc_id}: freshest data {freshest} is {age} days old "
+                        f"(kept {current})")
+            continue
         if not (lo <= new_price <= hi):
-            kept.append(f"{doc_id}: feed value ₹{new_price}/kg outside sane bounds "
+            kept.append(f"{doc_id}: ₹{new_price}/kg outside sane bounds "
                         f"{lo}-{hi} (kept {current})")
+            continue
+        if current is not None and abs(new_price - current) / current > MAX_JUMP:
+            kept.append(f"{doc_id}: ₹{new_price}/kg jumps >50% from stored "
+                        f"₹{current} — needs a human look (kept {current})")
             continue
         if current is not None and new_price == current:
             kept.append(f"{doc_id}: unchanged at ₹{new_price}/kg")
@@ -138,17 +173,17 @@ def main():
             "pricePerKg": new_price,
             "trend": trend,
             "up": new_price >= (current or 0),
-            "source": "Agmarknet Kerala modal via data.gov.in (auto-refresh)",
+            "source": "KisanDeals Kerala modal (Agmarknet/eNAM), auto-refresh",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
         updated.append(f"{doc_id}: ₹{current} -> ₹{new_price}/kg (trend {trend:+d}%)")
+
+    kept.append("vanilla: no reliable daily feed (kept last verified value)")
 
     print("\nUpdated:")
     print("\n".join("  " + u for u in updated) or "  (none)")
     print("Kept as-is:")
     print("\n".join("  " + k for k in kept) or "  (none)")
-    if not updated and len(kept) == len(TARGETS):
-        print("\nWARNING: nothing was updated. Check the feed and this log.")
 
 
 if __name__ == "__main__":
