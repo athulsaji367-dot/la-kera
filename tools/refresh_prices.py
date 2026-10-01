@@ -7,7 +7,10 @@ republish the official Agmarknet / eNAM APMC data. Why not data.gov.in
 directly? api.data.gov.in refuses connections from outside India
 (connection refused from GitHub's runners — verified 2026-10-01), so the
 official API cannot be used from GitHub Actions. KisanDeals serves the
-same underlying mandi data and is reachable worldwide.
+same underlying mandi data and is reachable worldwide — but its bot
+protection 403s bare datacenter clients, so fetching uses a
+Chrome-impersonating HTTP client (curl_cffi) with a full-header
+`requests` fallback.
 
 For each spice the script parses the market-wise table, takes the rows
 from the freshest reported date, and uses the MEDIAN modal price across
@@ -37,12 +40,16 @@ from datetime import date, datetime
 from html.parser import HTMLParser
 from statistics import median
 
-import requests
-
 BASE = "https://www.kisandeals.com/mandiprices/{slug}/KERALA/ALL"
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
-                    "la-kera-price-refresh/2.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
 MAX_AGE_DAYS = 45
 MAX_JUMP = 0.50  # reject changes larger than +/-50% vs stored price
 
@@ -57,6 +64,23 @@ TARGETS = {
     "turmeric": ("TURMERIC", (60, 400)),
     # "vanilla": no trustworthy daily feed — intentionally absent.
 }
+
+
+def get_html(url):
+    """Fetch a page's HTML, impersonating Chrome; fall back to requests."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        r = cffi_requests.get(url, headers=HEADERS, impersonate="chrome124",
+                              timeout=60)
+        if r.status_code != 200:
+            raise ValueError(f"HTTP {r.status_code} via curl_cffi")
+        return r.text
+    except Exception as e:
+        print(f"    (curl_cffi path failed: {e}; trying requests)")
+    import requests
+    r = requests.get(url, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    return r.text
 
 
 class TableParser(HTMLParser):
@@ -87,10 +111,8 @@ class TableParser(HTMLParser):
 
 def fetch_latest_median_per_kg(slug):
     """Return (₹/kg median modal, freshest date, market count) or raise."""
-    r = requests.get(BASE.format(slug=slug), headers=UA, timeout=60)
-    r.raise_for_status()
     parser = TableParser()
-    parser.feed(r.text)
+    parser.feed(get_html(BASE.format(slug=slug)))
     by_date = {}
     for cells in parser.rows:
         # Market table: [desc, variety, market, district, state,
